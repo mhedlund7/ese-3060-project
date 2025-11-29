@@ -154,7 +154,7 @@ class CifarLoader:
             print("IS_CHANNELS_LAST:", batch_x.is_contiguous(memory_format=torch.channels_last))
             print("IS_CONTIGUOUS (NCHW):", batch_x.is_contiguous())
 
-            batch_x = batch_x.contiguous()
+            # batch_x = batch_x.contiguous()
             print(" DEBUG AFTER CONTIGUOUS")
             print("SHAPE:", batch_x.shape)
             print("STRIDES:", batch_x.stride())
@@ -453,13 +453,23 @@ def main(run):
             #change 
             #onc memory is pinned it overlaps cpu to gpu transfer 
             # outputs = model(inputs)
+            print("DEBUG STEP 1 - After dataloader:")
+            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             if train_loader.aug.get('flip', False):
                 inputs = batch_flip_lr(inputs)
+            print("DEBUG STEP 2 - After flip:")
+            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             pad = train_loader.aug.get('translate', 0)
             if pad > 0:
                 inputs = random_translate(inputs, pad)
+                print("DEBUG STEP 3 - After translate:")
+                print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             inputs = inputs.contiguous()
+            print("DEBUG STEP 4 - After contiguous():")
+            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             inputs = inputs.to(memory_format=torch.channels_last)
+            print("DEBUG STEP 5 - After to(channels_last):")
+            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             assert inputs.shape[1] == 3, f"BAD SHAPE: {inputs.shape}"
             outputs = model(inputs)
             # end change
