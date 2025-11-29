@@ -116,7 +116,7 @@ class CifarLoader:
         images = images.half().cuda(non_blocking=True)
         self.images = images.to(memory_format=torch.channels_last)
         print("DEBUG DATALOADER SHAPE:", self.images.shape)
-        self.labels = labels
+        self.labels = labels.long().cuda(non_blocking=True)
         self.classes = classes
         self.device = DEVICE
 
