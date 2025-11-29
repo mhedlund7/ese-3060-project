@@ -108,18 +108,13 @@ class CifarLoader:
         # change here 
         # data = torch.load(data_path, map_location=torch.device(gpu))
         data = torch.load(data_path, map_location='cpu')
-        #end change
         images, labels, classes = data['images'], data['labels'], data['classes']
-        # It's faster to load+process uint8 data than to load preprocessed fp16 data
-        #change
-        # self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
-        images = images.float() / 255.0
-        images = images.permute(0, 3, 1, 2).contiguous()
+        images = images.permute(0, 3, 1, 2).float() / 255.0
         normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
         images = normalize(images)
-        images = images.half().to(device=DEVICE, memory_format=torch.channels_last, non_blocking=True)
-        labels = labels.long().to(DEVICE, non_blocking=True)
-        self.images = images 
+        images = images.half().cuda(non_blocking=True)
+        labels = labels.long().cuda(non_blocking=True)
+        self.images = images.to(memory_format=torch.channels_last)
         self.labels = labels
         self.classes = classes
         self.device = DEVICE
@@ -447,6 +442,7 @@ def main(run):
             pad = train_loader.aug.get('translate', 0)
             if pad > 0:
                 inputs = random_translate(inputs, pad)
+            inputs = inputs.contiguous(memory_format=torch.channels_last)
             outputs = model(inputs)
             # end change
             loss = loss_fn(outputs, labels).sum()
