@@ -92,7 +92,7 @@ def random_translate(inputs, pad):
     x_idx = base_x + xs[:, None, None]
     y_idx = y_idx.clamp(0, h + 2*pad - 1)
     x_idx = x_idx.clamp(0, w + 2*pad - 1)
-    out = padded[torch.arange(n)[:, None, None], :, y_idx, x_idx]  # -> (N, C, H, W)
+    out = padded[torch.arange(n).view(n, 1, 1), :, y_idx, x_idx]
     return out.contiguous()
 
 class CifarLoader:
@@ -442,7 +442,9 @@ def main(run):
             pad = train_loader.aug.get('translate', 0)
             if pad > 0:
                 inputs = random_translate(inputs, pad)
-            inputs = inputs.contiguous(memory_format=torch.channels_last)
+            inputs = inputs.contiguous()
+            inputs = inputs.to(memory_format=torch.channels_last)
+            assert inputs.shape[1] == 3, f"BAD SHAPE: {inputs.shape}"
             outputs = model(inputs)
             # end change
             loss = loss_fn(outputs, labels).sum()
