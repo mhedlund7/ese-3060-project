@@ -459,7 +459,6 @@ def main(run):
             if pad > 0:
                 inputs = random_translate(inputs, pad)
             inputs = inputs.contiguous()
-            inputs = inputs.permute(0, 1, 2, 3).contiguous()
             inputs = inputs.to(memory_format=torch.channels_last)
             assert inputs.shape[1] == 3, f"BAD SHAPE: {inputs.shape}"
             outputs = model(inputs)
