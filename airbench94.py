@@ -109,12 +109,13 @@ class CifarLoader:
         # data = torch.load(data_path, map_location=torch.device(gpu))
         data = torch.load(data_path, map_location='cpu')
         images, labels, classes = data['images'], data['labels'], data['classes']
-        images = images.permute(0, 3, 1, 2).float() / 255.0
+        images = images.permute(0, 3, 1, 2).contiguous()
+        images = images.float().div_(255.0)
         normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
         images = normalize(images)
         images = images.half().cuda(non_blocking=True)
-        labels = labels.long().cuda(non_blocking=True)
         self.images = images.to(memory_format=torch.channels_last)
+        print("DEBUG DATALOADER SHAPE:", self.images.shape)
         self.labels = labels
         self.classes = classes
         self.device = DEVICE
@@ -443,6 +444,7 @@ def main(run):
             if pad > 0:
                 inputs = random_translate(inputs, pad)
             inputs = inputs.contiguous()
+            inputs = inputs.permute(0, 1, 2, 3).contiguous()
             inputs = inputs.to(memory_format=torch.channels_last)
             assert inputs.shape[1] == 3, f"BAD SHAPE: {inputs.shape}"
             outputs = model(inputs)
