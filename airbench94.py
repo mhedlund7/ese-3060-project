@@ -82,8 +82,17 @@ def batch_flip_lr(inputs):
 def random_translate(inputs, pad):
     if pad <= 0:
         return inputs
+    print("TRANSLATE DEBUG 0 - Input:")
+    print("  SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
+    inputs = inputs.contiguous()
+    print("TRANSLATE DEBUG 1 - After contiguous():")
+    print("  SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
     n, c, h, w = inputs.shape
+    print("TRANSLATE DEBUG 2 - Extracted dimensions:")
+    print("  n={}, c={}, h={}, w={}".format(n, c, h, w))
     padded = F.pad(inputs, (pad, pad, pad, pad), mode="reflect")
+    print("TRANSLATE DEBUG 3 - After padding:")
+    print("  SHAPE:", padded.shape, "STRIDES:", padded.stride())
     ys = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     xs = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     base_y = torch.arange(h, device=inputs.device)[None, :, None] + pad
@@ -92,8 +101,16 @@ def random_translate(inputs, pad):
     x_idx = base_x + xs[:, None, None]
     y_idx = y_idx.clamp(0, h + 2*pad - 1)
     x_idx = x_idx.clamp(0, w + 2*pad - 1)
+    print("TRANSLATE DEBUG 4 - Index shapes:")
+    print("  y_idx.shape:", y_idx.shape, "x_idx.shape:", x_idx.shape)
     out = padded[torch.arange(n).view(n, 1, 1), :, y_idx, x_idx]
-    return out.contiguous(memory_format=torch.channels_last)
+    print("TRANSLATE DEBUG 5 - After indexing:")
+    print("  SHAPE:", out.shape, "STRIDES:", out.stride())
+    out = out.contiguous(memory_format=torch.channels_last)
+    print("TRANSLATE DEBUG 6 - After contiguous(channels_last):")
+    print("  SHAPE:", out.shape, "STRIDES:", out.stride())
+    return out
+
 
 class CifarLoader:
 
