@@ -95,15 +95,18 @@ def random_translate(inputs, pad):
     print("  SHAPE:", padded.shape, "STRIDES:", padded.stride())
     ys = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     xs = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
-    base_y = torch.arange(h, device=inputs.device)[None, :, None] + pad
-    base_x = torch.arange(w, device=inputs.device)[None, None, :] + pad
-    y_idx = base_y + ys[:, None, None]
-    x_idx = base_x + xs[:, None, None]
-    y_idx = y_idx.clamp(0, h + 2*pad - 1)
-    x_idx = x_idx.clamp(0, w + 2*pad - 1)
+    y_base = torch.arange(h, device=inputs.device).view(1, h, 1) + pad
+    x_base = torch.arange(w, device=inputs.device).view(1, 1, w) + pad
+    y_idx = (y_base + ys.view(n, 1, 1)).clamp(0, h + 2*pad - 1)
+    x_idx = (x_base + xs.view(n, 1, 1)).clamp(0, w + 2*pad - 1)
     print("TRANSLATE DEBUG 4 - Index shapes:")
     print("  y_idx.shape:", y_idx.shape, "x_idx.shape:", x_idx.shape)
-    out = padded[torch.arange(n).view(n, 1, 1), :, y_idx, x_idx]
+    out = padded[
+        torch.arange(n, device=inputs.device).view(n, 1, 1, 1),
+        torch.arange(c, device=inputs.device).view(1, c, 1, 1),
+        y_idx.view(n, 1, h, 1),
+        x_idx.view(n, 1, 1, w)
+    ]
     print("TRANSLATE DEBUG 5 - After indexing:")
     print("  SHAPE:", out.shape, "STRIDES:", out.stride())
     out = out.contiguous(memory_format=torch.channels_last)
