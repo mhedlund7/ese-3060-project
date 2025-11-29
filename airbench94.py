@@ -384,7 +384,9 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
-        
+    # Keep a direct reference to the whitening conv layer before any compilation
+    whitening_layer = model[0]
+
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
@@ -415,7 +417,7 @@ def main(run):
     # Initialize the whitening layer using training images
     starter.record()
     train_images = train_loader.normalize(train_loader.images[:5000])
-    init_whitening_conv(model[0], train_images)
+    init_whitening_conv(whitening_layer, train_images)
     ender.record()
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
@@ -427,7 +429,7 @@ def main(run):
 
     for epoch in range(ceil(epochs)):
 
-        model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        whitening_layer.bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
         ####################
         #     Training     #
