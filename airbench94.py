@@ -28,8 +28,8 @@ torch.backends.cudnn.benchmark = True
 
 
 # Set whether to precompile model with (precompiled baseline should be 3.29 as opposed to 3.83):
-# AIRBENCH_USE_COMPILE=0 AIRBENCH_USE_WARMUP=1 python airbench94.py   uncompiled baseline
-# AIRBENCH_USE_COMPILE=1 AIRBENCH_USE_WARMUP=1 python airbench94.py   compiled baseline
+# AIRBENCH_USE_COMPILE=0 python airbench94.py   uncompiled baseline
+# AIRBENCH_USE_COMPILE=1 python airbench94.py   compiled baseline
 
 # Or set for multiple runs with:
 # export AIRBENCH_USE_COMPILE=1
@@ -384,9 +384,6 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
-
-    if USE_COMPILE:
-        model = torch.compile(model)
         
     current_steps = 0
 
@@ -422,6 +419,10 @@ def main(run):
     ender.record()
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+
+    # Compile the model if needed
+    if USE_COMPILE:
+        model = torch.compile(model)
 
 
     for epoch in range(ceil(epochs)):
