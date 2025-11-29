@@ -82,36 +82,22 @@ def batch_flip_lr(inputs):
 def random_translate(inputs, pad):
     if pad <= 0:
         return inputs
-    print("TRANSLATE DEBUG 0 - Input:")
-    print("  SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
     inputs = inputs.contiguous()
-    print("TRANSLATE DEBUG 1 - After contiguous():")
-    print("  SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
     n, c, h, w = inputs.shape
-    print("TRANSLATE DEBUG 2 - Extracted dimensions:")
-    print("  n={}, c={}, h={}, w={}".format(n, c, h, w))
     padded = F.pad(inputs, (pad, pad, pad, pad), mode="reflect")
-    print("TRANSLATE DEBUG 3 - After padding:")
-    print("  SHAPE:", padded.shape, "STRIDES:", padded.stride())
     ys = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     xs = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     y_base = torch.arange(h, device=inputs.device).view(1, h, 1) + pad
     x_base = torch.arange(w, device=inputs.device).view(1, 1, w) + pad
     y_idx = (y_base + ys.view(n, 1, 1)).clamp(0, h + 2*pad - 1)
     x_idx = (x_base + xs.view(n, 1, 1)).clamp(0, w + 2*pad - 1)
-    print("TRANSLATE DEBUG 4 - Index shapes:")
-    print("  y_idx.shape:", y_idx.shape, "x_idx.shape:", x_idx.shape)
     out = padded[
         torch.arange(n, device=inputs.device).view(n, 1, 1, 1),
         torch.arange(c, device=inputs.device).view(1, c, 1, 1),
         y_idx.view(n, 1, h, 1),
         x_idx.view(n, 1, 1, w)
     ]
-    print("TRANSLATE DEBUG 5 - After indexing:")
-    print("  SHAPE:", out.shape, "STRIDES:", out.stride())
     out = out.contiguous(memory_format=torch.channels_last)
-    print("TRANSLATE DEBUG 6 - After contiguous(channels_last):")
-    print("  SHAPE:", out.shape, "STRIDES:", out.stride())
     return out
 
 
@@ -135,7 +121,6 @@ class CifarLoader:
         images = normalize(images)
         images = images.half().cuda(non_blocking=True)
         self.images = images.to(memory_format=torch.channels_last)
-        print("DEBUG DATALOADER SHAPE:", self.images.shape)
         self.labels = labels.long().cuda(non_blocking=True)
         self.classes = classes
         self.device = DEVICE
@@ -168,18 +153,6 @@ class CifarLoader:
             idxs = indices[i * self.batch_size:(i + 1) * self.batch_size]
             batch_x = self.images[idxs]
             batch_y = self.labels[idxs]
-            print("DEBUG BEFORE CONTIGUOUS")
-            print("SHAPE:", batch_x.shape)
-            print("STRIDES:", batch_x.stride())
-            print("IS_CHANNELS_LAST:", batch_x.is_contiguous(memory_format=torch.channels_last))
-            print("IS_CONTIGUOUS (NCHW):", batch_x.is_contiguous())
-
-            # batch_x = batch_x.contiguous()
-            print(" DEBUG AFTER CONTIGUOUS")
-            print("SHAPE:", batch_x.shape)
-            print("STRIDES:", batch_x.stride())
-            print("IS_CHANNELS_LAST:", batch_x.is_contiguous(memory_format=torch.channels_last))
-            print("IS_CONTIGUOUS (NCHW):", batch_x.is_contiguous())
             yield batch_x, batch_y
 
             
@@ -473,23 +446,13 @@ def main(run):
             #change 
             #onc memory is pinned it overlaps cpu to gpu transfer 
             # outputs = model(inputs)
-            print("DEBUG STEP 1 - After dataloader:")
-            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             if train_loader.aug.get('flip', False):
                 inputs = batch_flip_lr(inputs)
-            print("DEBUG STEP 2 - After flip:")
-            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             pad = train_loader.aug.get('translate', 0)
             if pad > 0:
                 inputs = random_translate(inputs, pad)
-                print("DEBUG STEP 3 - After translate:")
-                print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             inputs = inputs.contiguous()
-            print("DEBUG STEP 4 - After contiguous():")
-            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             inputs = inputs.to(memory_format=torch.channels_last)
-            print("DEBUG STEP 5 - After to(channels_last):")
-            print("SHAPE:", inputs.shape, "STRIDES:", inputs.stride())
             assert inputs.shape[1] == 3, f"BAD SHAPE: {inputs.shape}"
             outputs = model(inputs)
             # end change
