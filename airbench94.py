@@ -26,6 +26,9 @@ import datetime
 
 torch.backends.cudnn.benchmark = True
 
+USE_COMPILE = bool(int(os.environ.get("AIRBENCH_USE_COMPILE", "1")))
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
 # * Assuming time-constant gradients, the average step size is decoupled from everything but the lr.
@@ -76,41 +79,21 @@ def batch_flip_lr(inputs):
     flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
     return torch.where(flip_mask, inputs.flip(-1), inputs)
 
-def batch_crop(images, crop_size):
-    r = (images.size(-1) - crop_size)//2
-    shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
-    images_out = torch.empty((len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype)
-    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
-    if r <= 2:
-        for sy in range(-r, r+1):
-            for sx in range(-r, r+1):
-                mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
-                images_out[mask] = images[mask, :, r+sy:r+sy+crop_size, r+sx:r+sx+crop_size]
-    else:
-        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), device=images.device, dtype=images.dtype)
-        for s in range(-r, r+1):
-            mask = (shifts[:, 0] == s)
-            images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
-        for s in range(-r, r+1):
-            mask = (shifts[:, 1] == s)
-            images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
-    return images_out
-
-#change
-#added in helper to avoid calling torch.randint every time
-def batch_crop_precomputed(images, shifts, crop_size):
-    r = (images.size(-1) - crop_size)//2
-    images_out = torch.empty((len(images), 3, crop_size, crop_size),
-                             device=images.device, dtype=images.dtype)
-    images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), device=images.device, dtype=images.dtype)
-    for s in range(-r, r+1):
-        mask = (shifts[:,0] == s)
-        images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
-    for s in range(-r, r+1):
-        mask = (shifts[:,1] == s)
-        images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
-    return images_out
-#end change
+def random_translate(inputs, pad):
+    if pad <= 0:
+        return inputs
+    n, c, h, w = inputs.shape
+    padded = F.pad(inputs, (pad, pad, pad, pad), mode="reflect")  # (N, C, H+2p, W+2p)
+    ys = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
+    xs = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
+    base_y = torch.arange(h, device=inputs.device)[None, :, None] + pad
+    base_x = torch.arange(w, device=inputs.device)[None, None, :] + pad
+    y_idx = base_y + ys[:, None, None]
+    x_idx = base_x + xs[:, None, None]
+    y_idx = y_idx.clamp(0, h + 2*pad - 1)
+    x_idx = x_idx.clamp(0, w + 2*pad - 1)
+    out = padded[torch.arange(n)[:, None, None], :, y_idx, x_idx]  # -> (N, C, H, W)
+    return out.contiguous()
 
 class CifarLoader:
 
@@ -126,75 +109,49 @@ class CifarLoader:
         # data = torch.load(data_path, map_location=torch.device(gpu))
         data = torch.load(data_path, map_location='cpu')
         #end change
-        self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
+        images, labels, classes = data['images'], data['labels'], data['classes']
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
-        self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
-        #change adding only 
-        #should allow for pinned memory transfer async cpu to gpu with dma so 
-        #transfer overlaps wtih compute
-        self.images = self.images.pin_memory()
-        self.labels = self.labels.pin_memory()
-        #end change
-        self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
-        self.proc_images = {} # Saved results of image processing to be done on the first epoch
-        self.epoch = 0
+        #change
+        # self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
+        images = images.float() / 255.0
+        images = images.permute(0, 3, 1, 2).contiguous()
+        normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
+        images = normalize(images)
+        images = images.half().to(device=DEVICE, memory_format=torch.channels_last, non_blocking=True)
+        labels = labels.long().to(DEVICE, non_blocking=True)
+        self.images = images 
+        self.labels = labels
+        self.classes = classes
+        self.device = DEVICE
 
         self.aug = aug or {}
         for k in self.aug.keys():
-            assert k in ['flip', 'translate'], 'Unrecognized key: %s' % k
+            assert k in ['flip', 'translate'], f'Unrecognized key: {k}'
 
         self.batch_size = batch_size
         self.drop_last = train if drop_last is None else drop_last
         self.shuffle = train if shuffle is None else shuffle
 
+
+
     def __len__(self):
-        return len(self.images)//self.batch_size if self.drop_last else ceil(len(self.images)/self.batch_size)
-
-    def __iter__(self):
-
-        if self.epoch == 0:
-            images = self.proc_images['norm'] = self.normalize(self.images)
-            # Pre-flip images in order to do every-other epoch flipping scheme
-            if self.aug.get('flip', False):
-                images = self.proc_images['flip'] = batch_flip_lr(images)
-            # Pre-pad images to save time when doing random translation
-            pad = self.aug.get('translate', 0)
-            if pad > 0:
-                self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
-## change:
-        # if self.aug.get('translate', 0) > 0:
-        #     images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
-        if self.aug.get('translate', 0) > 0:
-            # Precompute shifts for whole dataset ONCE
-            if 'shifts' not in self.proc_images:
-                r = self.aug['translate']
-                n = len(self.images)
-                #change below 
-                # self.proc_images['shifts'] = torch.randint(
-                #     -r, r+1, (n, 2), device=self.images.device
-                # )
-                self.proc_images['shifts'] = torch.randint(-r, r+1, (n, 2), device='cpu').pin_memory()
-# end change
-                
-            images = batch_crop_precomputed(self.proc_images['pad'],
-                                            self.proc_images['shifts'],
-                                            self.images.shape[-2])
-## end chage
-        elif self.aug.get('flip', False):
-            images = self.proc_images['flip']
+        n = len(self.images)
+        if self.drop_last:
+            return n // self.batch_size
         else:
-            images = self.proc_images['norm']
-        # Flip all images together every other epoch. This increases diversity relative to random flipping
-        if self.aug.get('flip', False):
-            if self.epoch % 2 == 1:
-                images = images.flip(-1)
+            return ceil(n / self.batch_size)
+    
+    def __iter__(self):
+        n = len(self.images)
+        if self.shuffle:
+            indices = torch.randperm(n, device=self.device)
+        else:
+            indices = torch.arange(n, device=self.device)
 
-        self.epoch += 1
-
-        indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
         for i in range(len(self)):
-            idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
-            yield (images[idxs], self.labels[idxs])
+            idxs = indices[i * self.batch_size:(i + 1) * self.batch_size]
+            yield self.images[idxs], self.labels[idxs]
+            
 
 #############################################
 #            Network Components             #
@@ -378,24 +335,19 @@ def infer(model, loader, tta_level=0):
         return 0.5 * logits + 0.5 * logits_translate
 
     model.eval()
-    test_images = loader.normalize(loader.images)
-    infer_fn = [infer_basic, infer_mirror, infer_mirror_translate][tta_level]
-    logits_list = []
     #change
-    # with torch.no_grad():
-    # return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
-    with torch.no_grad():
-        for inputs in test_images.split(2000):
-            inputs = inputs.cuda(non_blocking=True)
-            logits_list.append(infer_fn(inputs, model))
-        return torch.cat(logits_list)
+    # test_images = loader.normalize(loader.images)
+    test_images = loader.images
     #end change
+    infer_fn = [infer_basic, infer_mirror, infer_mirror_translate][tta_level]
+    with torch.no_grad():
+        return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
 
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     #change
     # return (logits.argmax(1) == loader.labels).float().mean().item()
-    labels = loader.labels.cuda(non_blocking=True)
+    labels = loader.labels
     return (logits.argmax(1) == labels).float().mean().item()
 #end change
 
@@ -455,13 +407,24 @@ def main(run):
 
     # Initialize the whitening layer using training images
     starter.record()
-    train_images = train_loader.normalize(train_loader.images[:5000])
-    init_whitening_conv(model[0], train_images)
+    #change
+    # train_images = train_loader.normalize(train_loader.images[:5000])
+    raw_data = torch.load('cifar10/train.pt', map_location='cpu')
+    raw_images = raw_data['images'][:5000]
+    raw_images = raw_images.float() / 255.0
+    raw_images = raw_images.permute(0, 3, 1, 2)
+    init_whitening_conv(model[0], raw_images)
+
+#end change
     ender.record()
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
     #change add in
     model = torch.compile(model, mode="reduce-overhead", backend="inductor")
+    for m in model.modules():
+        if isinstance(m, BatchNorm):
+            m.float()
+            m.eval()
     #end change
 
     for epoch in range(ceil(epochs)):
@@ -479,8 +442,11 @@ def main(run):
             #change 
             #onc memory is pinned it overlaps cpu to gpu transfer 
             # outputs = model(inputs)
-            inputs = inputs.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
+            if train_loader.aug.get('flip', False):
+                inputs = batch_flip_lr(inputs)
+            pad = train_loader.aug.get('translate', 0)
+            if pad > 0:
+                inputs = random_translate(inputs, pad)
             outputs = model(inputs)
             # end change
             loss = loss_fn(outputs, labels).sum()
