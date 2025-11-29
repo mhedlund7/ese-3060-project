@@ -511,14 +511,28 @@ if __name__ == "__main__":
     #main('warmup')
     start_time = datetime.datetime.now()
     print(f"Starting 25 runs at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    accs = torch.tensor([main(run) for run in range(25)])
+    accs_list = []
+    times_list = []
+    for run in range(25):
+        run_start = datetime.datetime.now()
+        acc = main(run)
+        run_end = datetime.datetime.now()
+        accs_list.append(acc)
+        times_list.append((run_end - run_start).total_seconds())
+    accs = torch.tensor(accs_list)
+    times = torch.tensor(times_list)
+    mean_time = times.mean().item()
+
     end_time = datetime.datetime.now()
     elapsed = end_time - start_time
-    print(f"Finished 25 runs at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Total elapsed time: {elapsed}")
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
-
-    log = {'code': code, 'accs': accs, 'created_at': __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    log = {
+    'code': code,
+    'accs': accs,
+    'times': times,
+    'mean_time': mean_time,
+    'created_at': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
