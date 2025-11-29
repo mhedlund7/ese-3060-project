@@ -420,11 +420,11 @@ def main(run):
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
     #change add in
-    model = torch.compile(model, mode="reduce-overhead", backend="inductor")
-    for m in model.modules():
-        if isinstance(m, BatchNorm):
-            m.float()
-            m.eval()
+    # model = torch.compile(model, mode="reduce-overhead", backend="inductor")
+    # for m in model.modules():
+    #     if isinstance(m, BatchNorm):
+    #         m.float()
+    #         m.eval()
     #end change
 
     for epoch in range(ceil(epochs)):
@@ -468,6 +468,7 @@ def main(run):
         ender.record()
         torch.cuda.synchronize()
         total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+
 
         ####################
         #    Evaluation    #
