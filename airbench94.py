@@ -83,7 +83,7 @@ def random_translate(inputs, pad):
     if pad <= 0:
         return inputs
     n, c, h, w = inputs.shape
-    padded = F.pad(inputs, (pad, pad, pad, pad), mode="reflect")  # (N, C, H+2p, W+2p)
+    padded = F.pad(inputs, (pad, pad, pad, pad), mode="reflect")
     ys = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     xs = torch.randint(-pad, pad + 1, (n,), device=inputs.device)
     base_y = torch.arange(h, device=inputs.device)[None, :, None] + pad
@@ -93,7 +93,7 @@ def random_translate(inputs, pad):
     y_idx = y_idx.clamp(0, h + 2*pad - 1)
     x_idx = x_idx.clamp(0, w + 2*pad - 1)
     out = padded[torch.arange(n).view(n, 1, 1), :, y_idx, x_idx]
-    return out.contiguous()
+    return out.contiguous(memory_format=torch.channels_last)
 
 class CifarLoader:
 
