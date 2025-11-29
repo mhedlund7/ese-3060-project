@@ -21,6 +21,8 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
+import datetime
+
 
 torch.backends.cudnn.benchmark = True
 
@@ -94,21 +96,45 @@ def batch_crop(images, crop_size):
             images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
     return images_out
 
+#change
+#added in helper to avoid calling torch.randint every time
+def batch_crop_precomputed(images, shifts, crop_size):
+    r = (images.size(-1) - crop_size)//2
+    images_out = torch.empty((len(images), 3, crop_size, crop_size),
+                             device=images.device, dtype=images.dtype)
+    images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), device=images.device, dtype=images.dtype)
+    for s in range(-r, r+1):
+        mask = (shifts[:,0] == s)
+        images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
+    for s in range(-r, r+1):
+        mask = (shifts[:,1] == s)
+        images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
+    return images_out
+#end change
+
 class CifarLoader:
 
     def __init__(self, path, train=True, batch_size=500, aug=None, drop_last=None, shuffle=None, gpu=0):
+        
         data_path = os.path.join(path, 'train.pt' if train else 'test.pt')
         if not os.path.exists(data_path):
             dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
             torch.save({'images': images, 'labels': labels, 'classes': dset.classes}, data_path)
-
-        data = torch.load(data_path, map_location=torch.device(gpu))
+        # change here 
+        # data = torch.load(data_path, map_location=torch.device(gpu))
+        data = torch.load(data_path, map_location='cpu')
+        #end change
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
-
+        #change adding only 
+        #should allow for pinned memory transfer async cpu to gpu with dma so 
+        #transfer overlaps wtih compute
+        self.images = self.images.pin_memory()
+        self.labels = self.labels.pin_memory()
+        #end change
         self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
         self.proc_images = {} # Saved results of image processing to be done on the first epoch
         self.epoch = 0
@@ -135,9 +161,25 @@ class CifarLoader:
             pad = self.aug.get('translate', 0)
             if pad > 0:
                 self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
-
+## change:
+        # if self.aug.get('translate', 0) > 0:
+        #     images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
         if self.aug.get('translate', 0) > 0:
-            images = batch_crop(self.proc_images['pad'], self.images.shape[-2])
+            # Precompute shifts for whole dataset ONCE
+            if 'shifts' not in self.proc_images:
+                r = self.aug['translate']
+                n = len(self.images)
+                #change below 
+                # self.proc_images['shifts'] = torch.randint(
+                #     -r, r+1, (n, 2), device=self.images.device
+                # )
+                self.proc_images['shifts'] = torch.randint(-r, r+1, (n, 2), device='cpu').pin_memory()
+# end change
+                
+            images = batch_crop_precomputed(self.proc_images['pad'],
+                                            self.proc_images['shifts'],
+                                            self.images.shape[-2])
+## end chage
         elif self.aug.get('flip', False):
             images = self.proc_images['flip']
         else:
@@ -286,9 +328,10 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
     if is_head or is_final_entry:
         print('-'*len(print_string))
 
-logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds']
+logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds', 'timestamp']
 def print_training_details(variables, is_final_entry):
     formatted = []
+    variables['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for col in logging_columns_list:
         var = variables.get(col.strip(), None)
         if type(var) in (int, str):
@@ -337,12 +380,25 @@ def infer(model, loader, tta_level=0):
     model.eval()
     test_images = loader.normalize(loader.images)
     infer_fn = [infer_basic, infer_mirror, infer_mirror_translate][tta_level]
+    logits_list = []
+    #change
+    # with torch.no_grad():
+    # return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
     with torch.no_grad():
-        return torch.cat([infer_fn(inputs, model) for inputs in test_images.split(2000)])
+        for inputs in test_images.split(2000):
+            inputs = inputs.cuda(non_blocking=True)
+            logits_list.append(infer_fn(inputs, model))
+        return torch.cat(logits_list)
+    #end change
 
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
-    return (logits.argmax(1) == loader.labels).float().mean().item()
+    #change
+    # return (logits.argmax(1) == loader.labels).float().mean().item()
+    labels = loader.labels.cuda(non_blocking=True)
+    return (logits.argmax(1) == labels).float().mean().item()
+#end change
+
 
 ############################################
 #                Training                  #
@@ -369,7 +425,6 @@ def main(run):
         # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
     total_train_steps = ceil(len(train_loader) * epochs)
-
     model = make_net()
     current_steps = 0
 
@@ -405,6 +460,9 @@ def main(run):
     ender.record()
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+    #change add in
+    model = torch.compile(model, mode="reduce-overhead", backend="inductor")
+    #end change
 
     for epoch in range(ceil(epochs)):
 
@@ -418,8 +476,13 @@ def main(run):
 
         model.train()
         for inputs, labels in train_loader:
-
+            #change 
+            #onc memory is pinned it overlaps cpu to gpu transfer 
+            # outputs = model(inputs)
+            inputs = inputs.cuda(non_blocking=True)
+            labels = labels.cuda(non_blocking=True)
             outputs = model(inputs)
+            # end change
             loss = loss_fn(outputs, labels).sum()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -475,7 +538,7 @@ if __name__ == "__main__":
     accs = torch.tensor([main(run) for run in range(25)])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
-    log = {'code': code, 'accs': accs}
+    log = {'code': code, 'accs': accs, 'created_at': __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
