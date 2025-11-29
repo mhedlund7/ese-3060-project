@@ -146,7 +146,22 @@ class CifarLoader:
 
         for i in range(len(self)):
             idxs = indices[i * self.batch_size:(i + 1) * self.batch_size]
-            yield self.images[idxs], self.labels[idxs]
+            batch_x = self.images[idxs]
+            batch_y = self.labels[idxs]
+            print("DEBUG BEFORE CONTIGUOUS")
+            print("SHAPE:", batch_x.shape)
+            print("STRIDES:", batch_x.stride())
+            print("IS_CHANNELS_LAST:", batch_x.is_contiguous(memory_format=torch.channels_last))
+            print("IS_CONTIGUOUS (NCHW):", batch_x.is_contiguous())
+
+            batch_x = batch_x.contiguous()
+            print(" DEBUG AFTER CONTIGUOUS")
+            print("SHAPE:", batch_x.shape)
+            print("STRIDES:", batch_x.stride())
+            print("IS_CHANNELS_LAST:", batch_x.is_contiguous(memory_format=torch.channels_last))
+            print("IS_CONTIGUOUS (NCHW):", batch_x.is_contiguous())
+            yield batch_x, batch_y
+
             
 
 #############################################
