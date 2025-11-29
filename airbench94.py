@@ -509,7 +509,13 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     #main('warmup')
+    start_time = datetime.datetime.now()
+    print(f"Starting 25 runs at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     accs = torch.tensor([main(run) for run in range(25)])
+    end_time = datetime.datetime.now()
+    elapsed = end_time - start_time
+    print(f"Finished 25 runs at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total elapsed time: {elapsed}")
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {'code': code, 'accs': accs, 'created_at': __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
