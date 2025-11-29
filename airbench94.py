@@ -21,8 +21,21 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
+from datetime import datetime
 
 torch.backends.cudnn.benchmark = True
+
+
+
+# Set whether to precompile model with (precompiled baseline should be 3.29 as opposed to 3.83):
+# AIRBENCH_USE_COMPILE=0 AIRBENCH_USE_WARMUP=1 python airbench94.py   uncompiled baseline
+# AIRBENCH_USE_COMPILE=1 AIRBENCH_USE_WARMUP=1 python airbench94.py   compiled baseline
+
+# Or set for multiple runs with:
+# export AIRBENCH_USE_COMPILE=1
+# export AIRBENCH_USE_COMPILE=0
+
+USE_COMPILE = bool(int(os.environ.get("AIRBENCH_USE_COMPILE", "0")))
 
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
@@ -371,6 +384,10 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
+
+    if USE_COMPILE:
+        model = torch.compile(model)
+        
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
@@ -405,6 +422,7 @@ def main(run):
     ender.record()
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+
 
     for epoch in range(ceil(epochs)):
 
@@ -464,19 +482,35 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc
+    return tta_val_acc, total_time_seconds
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
     print_columns(logging_columns_list, is_head=True)
-    #main('warmup')
-    accs = torch.tensor([main(run) for run in range(25)])
+    main('warmup')
+    results = torch.tensor([main(run) for run in range(25)])
+    accs = results[:, 0]
+    times = results[:, 1]
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    print('Mean time: %.4f    Std time: %.4f' % (times.mean(), times.std()))
 
-    log = {'code': code, 'accs': accs}
-    log_dir = os.path.join('logs', str(uuid.uuid4()))
+    # Add timestamp to log files
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+
+    log = {
+        'code': code,
+        'accs': accs,
+        'times': times,
+        'timestamp': timestamp,
+        'compile': USE_COMPILE,
+    }
+    
+    # Add timestamp to log files
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    log_dir = os.path.join('logs', f"{timestamp}_{uuid.uuid4()}")
+
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
