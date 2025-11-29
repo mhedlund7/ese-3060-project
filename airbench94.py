@@ -510,8 +510,6 @@ if __name__ == "__main__":
         'compile': USE_COMPILE,
     }
     
-    # Add timestamp to log files
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     log_dir = os.path.join('logs', f"{timestamp}_{uuid.uuid4()}")
 
     os.makedirs(log_dir, exist_ok=True)
