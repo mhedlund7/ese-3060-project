@@ -364,6 +364,13 @@ def evaluate(model, loader, tta_level=0):
 def main(run, args):
     mode = args.mode
     
+    # --- COMMAND LINE OVERWRITES ---
+    if args.lr is not None:
+        hyp['opt']['lr'] = args.lr
+    if args.wd is not None:
+        hyp['opt']['weight_decay'] = args.wd
+    # -------------------------------
+    
     # Configure experiment settings based on mode
     use_lion = 'lion' in mode
     use_lookahead = 'lookahead' in mode or mode == 'baseline' or mode == 'hardswish'
@@ -375,7 +382,6 @@ def main(run, args):
     momentum = hyp['opt']['momentum']
     
     if use_lion:
-
         lr = (hyp['opt']['lr'] / 10.0) / 1024 # Heuristic downscaling
         wd = hyp['opt']['weight_decay'] * 1.0 
         lr_biases = lr * hyp['opt']['bias_scaler']
@@ -408,8 +414,9 @@ def main(run, args):
 
     # Select Optimizer
     if use_lion:
-        # Lion defaults: betas=(0.9, 0.99)
-        optimizer = Lion(param_configs, betas=(0.9, 0.99))
+        # Check for command line beta2 override
+        beta2 = args.beta2 if args.beta2 is not None else 0.99
+        optimizer = Lion(param_configs, betas=(0.9, beta2))
     else:
         optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
@@ -506,6 +513,11 @@ if __name__ == "__main__":
                         choices=['baseline', 'lion', 'lion_lookahead', 'hardswish'],
                         help='Experiment mode: baseline, lion, lion_lookahead, or hardswish')
     parser.add_argument('--runs', type=int, default=5, help='Number of runs to perform')
+
+    parser.add_argument('--lr', type=float, default=None, help='Overwrite base Learning Rate')
+    parser.add_argument('--wd', type=float, default=None, help='Overwrite Weight Decay')
+    parser.add_argument('--beta2', type=float, default=None, help='Overwrite Beta2 (Lion only)')
+
     args = parser.parse_args()
 
     with open(sys.argv[0]) as f:
