@@ -369,6 +369,10 @@ def main(run, args):
         hyp['opt']['lr'] = args.lr
     if args.wd is not None:
         hyp['opt']['weight_decay'] = args.wd
+    if args.bias_scaler is not None:
+        hyp['opt']['bias_scaler'] = args.bias_scaler
+    if args.label_smoothing is not None:
+        hyp['opt']['label_smoothing'] = args.label_smoothing
     # -------------------------------
     
     # Configure experiment settings based on mode
@@ -517,6 +521,11 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=None, help='Overwrite base Learning Rate')
     parser.add_argument('--wd', type=float, default=None, help='Overwrite Weight Decay')
     parser.add_argument('--beta2', type=float, default=None, help='Overwrite Beta2 (Lion only)')
+    
+    # --- NEW ARGUMENTS ---
+    parser.add_argument('--bias_scaler', type=float, default=None, help='Overwrite Bias Scaler (Default: 64.0)')
+    parser.add_argument('--label_smoothing', type=float, default=None, help='Overwrite Label Smoothing (Default: 0.2)')
+    # ---------------------
 
     args = parser.parse_args()
 
