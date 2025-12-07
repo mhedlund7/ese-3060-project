@@ -510,8 +510,8 @@ def main(run, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CIFAR-10 Speedrun Experiments')
     parser.add_argument('--mode', type=str, default='baseline', 
-                        choices=['baseline', 'lion', 'lion_lookahead', 'hardswish'],
-                        help='Experiment mode: baseline, lion, lion_lookahead, or hardswish')
+                        choices=['baseline', 'lion', 'lion_lookahead', 'hardswish', 'lion_hardswish'],
+                        help='Experiment mode: baseline, lion, lion_lookahead, hardswish, lion_hardswish')
     parser.add_argument('--runs', type=int, default=5, help='Number of runs to perform')
 
     parser.add_argument('--lr', type=float, default=None, help='Overwrite base Learning Rate')
