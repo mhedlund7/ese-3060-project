@@ -373,6 +373,8 @@ def main(run, args):
         hyp['opt']['bias_scaler'] = args.bias_scaler
     if args.label_smoothing is not None:
         hyp['opt']['label_smoothing'] = args.label_smoothing
+    if args.epochs is not None:
+        hyp['opt']['train_epochs'] = args.epochs
     # -------------------------------
     
     # Configure experiment settings based on mode
@@ -525,6 +527,7 @@ if __name__ == "__main__":
     # --- NEW ARGUMENTS ---
     parser.add_argument('--bias_scaler', type=float, default=None, help='Overwrite Bias Scaler (Default: 64.0)')
     parser.add_argument('--label_smoothing', type=float, default=None, help='Overwrite Label Smoothing (Default: 0.2)')
+    parser.add_argument('--epochs', type=float, default=None, help='Overwrite Training Epochs (Default: 9.9)')
     # ---------------------
 
     args = parser.parse_args()
