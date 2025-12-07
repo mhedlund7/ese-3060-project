@@ -1,5 +1,5 @@
 # Modified airbench94.py for ESE 3060 Final Project
-# Original Source: https://github.com/KellerJordan/cifar10-airbench/blob/master/legacy/airbench94.py [cite: 31, 38]
+# Original Source: https://github.com/KellerJordan/cifar10-airbench/blob/master/legacy/airbench94.py
 
 import os
 import sys
@@ -14,6 +14,10 @@ import torchvision
 import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
+
+#############################################
+#              Lion Optimizer               #
+#############################################
 
 class Lion(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
@@ -67,7 +71,7 @@ hyp = {
     'opt': {
         'train_epochs': 9.9,
         'batch_size': 1024,
-        'lr': 11.5,
+        'lr': 11.5, 
         'momentum': 0.85,
         'weight_decay': 0.0153,
         'bias_scaler': 64.0,
@@ -368,7 +372,6 @@ def main(run, args):
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
     
-    # --- Optimizer Parameter Setup ---
     momentum = hyp['opt']['momentum']
     
     if use_lion:
@@ -388,7 +391,9 @@ def main(run, args):
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
     
     if run == 'warmup':
+        # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
+    
     total_train_steps = ceil(len(train_loader) * epochs)
 
     # Initialize Model with selected activation
@@ -506,10 +511,18 @@ if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
-    main('warmup')
-    
     print(f"Running Experiment Mode: {args.mode}")
     print_columns(logging_columns_list, is_head=True)
+    
+    # ------------------
+    # Warmup Run Added
+    # ------------------
+    print("Performing warmup run...")
+    # We pass 'warmup' as the run identifier. 
+    # The return values are ignored.
+    main('warmup', args)
+    print("Warmup complete. Starting measured runs.")
+    print('-' * 100) # Visual separator
     
     # Collect results
     results = []
