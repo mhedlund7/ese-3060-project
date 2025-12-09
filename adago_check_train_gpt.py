@@ -20,6 +20,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+import argparse
 
 # Matplotlib for training curve plots
 import matplotlib
@@ -443,12 +444,34 @@ class Hyperparameters:
     #added fields
     block_optimizer : str = 'adago'
     short_run : bool = False
-args = Hyperparameters()
+
+    # tuning knobs
+    block_lr_mult : float = 0.1
+    adago_gamma : float = 1.0
+    adago_eps : float = 5e-4
 
 args = Hyperparameters()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--learning-rate", type=float, default=None)
+parser.add_argument("--adago-gamma", type=float, default=None)
+parser.add_argument("--adago-eps", type=float, default=None)
+parser.add_argument("--block-lr-mult", type=float, default=None)  # optional but useful
+
+cli, _ = parser.parse_known_args()
+
 block_opt_env = os.getenv("BLOCK_OPTIMIZER")
 if block_opt_env is not None:
     args.block_optimizer = block_opt_env
+
+if cli.learning_rate is not None:
+    args.learning_rate = cli.learning_rate
+if cli.adago_gamma is not None:
+    args.adago_gamma = cli.adago_gamma
+if cli.adago_eps is not None:
+    args.adago_eps = cli.adago_eps
+if cli.block_lr_mult is not None:
+    args.block_lr_mult = cli.block_lr_mult
 
 if os.getenv("SHORT_RUN", "0") == "1":
     args.short_run = True
@@ -535,7 +558,7 @@ elif args.block_optimizer.lower() == "adago":
     print("Using AdAGo optimizer for transformer blocks.")
     optimizer2 = AdAGo(
         block_params,
-        lr= 5 * 0.1 * args.learning_rate,
+        lr= args.block_lr_mult * 0.1 * args.learning_rate,
         momentum=0.95,
         nesterov=True,
         backend='newtonschulz5',
@@ -586,7 +609,7 @@ if master_process:
     # Create comprehensive metadata log
     transformer_opt_cfg = {
         'type': args.block_optimizer,
-        'lr': 0.1 * args.learning_rate,
+        'lr': args.block_lr_mult * 0.1 * args.learning_rate,
         'weight_decay': args.weight_decay,
     }
 
@@ -603,8 +626,8 @@ if master_process:
             'nesterov': True,
             'backend': 'newtonschulz5',
             'backend_steps': 5,
-            'gamma': 1.0,
-            'eps': 5e-4,
+            'gamma': args.adago_gamma,
+            'eps': args.adago_eps,
         })
     elif args.block_optimizer.lower() == "adagrad":
         transformer_opt_cfg.update({
