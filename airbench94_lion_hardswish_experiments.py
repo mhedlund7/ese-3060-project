@@ -454,6 +454,10 @@ def main(run, args):
     torch.cuda.synchronize()
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
+    # Training curve storage (optional, for plotting)
+    training_curve = []
+    capture_curve = hasattr(args, 'capture_curves') and args.capture_curves
+
     for epoch in range(ceil(epochs)):
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
@@ -494,6 +498,16 @@ def main(run, args):
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         train_loss = loss.item() / batch_size
         val_acc = evaluate(model, test_loader, tta_level=0)
+        
+        # Capture training curve if requested
+        if capture_curve:
+            training_curve.append({
+                'epoch': epoch + 1,
+                'train_loss': float(train_loss),
+                'train_acc': float(train_acc),
+                'val_acc': float(val_acc),
+            })
+        
         # Log mode along with stats
         print_training_details(locals(), is_final_entry=False)
         run = None 
@@ -511,7 +525,11 @@ def main(run, args):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc, total_time_seconds
+    # Return training curve if captured
+    if capture_curve:
+        return tta_val_acc, total_time_seconds, training_curve
+    else:
+        return tta_val_acc, total_time_seconds
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='CIFAR-10 Speedrun Experiments')
