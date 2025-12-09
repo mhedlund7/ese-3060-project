@@ -1,6 +1,8 @@
 numpy
 tqdm
 torch
+torchvision
+matplotlib
+scipy
 huggingface-hub
 kernels
-scipy
