@@ -505,11 +505,11 @@ if os.getenv("SHORT_RUN", "0") == "1":
 
 # if short_run is enabled, shrink iterations & val_tokens proportionally
 if args.short_run:
-    # e.g., ~500 iterations instead of 5100, fewer val tokens
+    # e.g., ~200 iterations instead of 5100, fewer val tokens
     print("Using short_run config, reducing num_iterations and val_tokens.")
-    # scale down roughly by 10x
-    args.num_iterations = 500
-    args.warmdown_iters = 150  # keep warmdown inside num_iterations
+    # scale down roughly by 25x
+    args.num_iterations = 200
+    args.warmdown_iters = 50  # keep warmdown inside num_iterations
     args.val_tokens = 2_097_152  # 2M tokens instead of 10M
     args.val_loss_every = 100
 
