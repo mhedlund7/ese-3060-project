@@ -158,6 +158,8 @@ class AdAGo(torch.optim.Optimizer):
             gstate = self.state.setdefault(id(group), {})
             if 'v_sq' not in gstate:
                 gstate['v_sq'] = torch.zeros((), dtype=torch.float32)
+            if 'step_count' not in gstate:
+                gstate['step_count'] = 0
 
             total_norm_sq = 0.0
             any_grad = False
@@ -180,6 +182,21 @@ class AdAGo(torch.optim.Optimizer):
             # alpha_t = max(eps, lr * min(||G||, gamma) / v)
             alpha = lr * (capped_norm / max(v, 1e-12))
             alpha = max(eps_floor, alpha)
+            
+            # Store diagnostics for logging
+            # Store diagnostics for logging
+            gstate['step_count'] += 1
+            gstate['last_diagnostics'] = {
+                'total_norm': total_norm,
+                'capped_norm': capped_norm,
+                'v': v,
+                'alpha': alpha,
+                'gamma': gamma,
+                'eps': eps_floor,
+                'alpha_over_eps': alpha / eps_floor if eps_floor > 0 else float('inf'),
+                'alpha_equals_eps': (alpha <= eps_floor * 1.000001) if eps_floor > 0 else False,
+            }
+
 
             # Per-parameter momentum + orthogonalized update
             for p in group['params']:
@@ -210,6 +227,16 @@ class AdAGo(torch.optim.Optimizer):
 
                 # Update
                 p.add_(g_ortho, alpha=-alpha * scale)
+    
+    def get_last_diagnostics(self):
+        """Get diagnostics from the last step() call for logging purposes."""
+        for group in self.param_groups:
+            gstate = self.state.get(id(group), {})
+            if 'last_diagnostics' in gstate:
+                diagnostics = gstate['last_diagnostics'].copy()
+                diagnostics['step_count'] = gstate.get('step_count', 0)
+                return diagnostics
+        return None
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -563,8 +590,8 @@ elif args.block_optimizer.lower() == "adago":
         nesterov=True,
         backend='newtonschulz5',
         backend_steps=5,
-        gamma=1.0,
-        eps=5e-4,
+        gamma=args.adago_gamma,
+        eps=args.adago_eps,
     )
 else:
     raise ValueError(f"Unknown block_optimizer: {args.block_optimizer}")
@@ -794,6 +821,28 @@ for step in range(args.num_iterations + 1):
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
+    
+    # Log AdAGo diagnostics for first 50-200 steps
+    if master_process and isinstance(optimizer2, AdAGo):
+        diagnostics = optimizer2.get_last_diagnostics()
+        if diagnostics is not None:
+            diag_step = diagnostics['step_count']
+            if 1 <= diag_step <= 50:
+                log_diag = (
+                    f"AdAGo[step={step+1},diag_step={diag_step}] "
+                    f"total_norm={diagnostics['total_norm']:.6f} "
+                    f"capped_norm={diagnostics['capped_norm']:.6f} "
+                    f"v={diagnostics['v']:.6f} "
+                    f"alpha={diagnostics['alpha']:.6f} "
+                    f"gamma={diagnostics['gamma']:.6f} "
+                    f"eps={diagnostics['eps']:.6e} "
+                    f"alpha/eps={diagnostics['alpha_over_eps']:.6f} "
+                    f"alpha==eps={diagnostics['alpha_equals_eps']}"
+                )
+                print(log_diag)
+                with open(logfile, "a") as f:
+                    f.write(log_diag + '\n')
+    
     # null the gradients
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
