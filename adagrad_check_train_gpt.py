@@ -345,7 +345,7 @@ class Hyperparameters:
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     #added fields
-    block_optimizer : str = 'adagrad'
+    block_optimizer : str = 'muon'
     short_run : bool = False
 args = Hyperparameters()
 
