@@ -742,13 +742,15 @@ for step in range(args.num_iterations + 1):
             training_data['steps'].append(step)
             training_data['train_times'].append(training_time_ms)
         
-        # log val loss to console and to logfile
+        # log val loss to console and to logfile (only every 100 steps or at last step)
         if master_process:
             step_avg = training_time_ms/(timed_steps-1) if timed_steps > 1 else 0
             log_line = f'step:{step}/{args.num_iterations} val_loss:{val_loss_value:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms'
             print(log_line)
-            with open(logfile, "a") as f:
-                f.write(log_line + '\n')
+            # Only write to log file every 100 steps or at the last step
+            if step % 100 == 0 or last_step:
+                with open(logfile, "a") as f:
+                    f.write(log_line + '\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -808,8 +810,10 @@ for step in range(args.num_iterations + 1):
         step_avg = approx_time/timed_steps if timed_steps > 0 else 0
         log_line = f"step:{step+1}/{args.num_iterations} train_loss:{train_loss_value:.4f} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms"
         print(log_line)
-        with open(logfile, "a") as f:
-            f.write(log_line + '\n')
+        # Only write to log file every 100 steps or at the last step
+        if (step + 1) % 100 == 0 or step == args.num_iterations - 1:
+            with open(logfile, "a") as f:
+                f.write(log_line + '\n')
 
 if master_process:
     # Final statistics and logging
