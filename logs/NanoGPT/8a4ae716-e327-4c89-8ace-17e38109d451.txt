@@ -1,0 +1,1070 @@
+====================================================================================================
+EXPERIMENT METADATA
+====================================================================================================
+Run ID: 8a4ae716-e327-4c89-8ace-17e38109d451
+Start Time: 2025-12-09T22:20:28.582061
+Random Seed: 1755377756
+DDP World Size: 8
+====================================================================================================
+HYPERPARAMETERS
+====================================================================================================
+input_bin: data/fineweb10B/fineweb_train_*.bin
+input_val_bin: data/fineweb10B/fineweb_val_*.bin
+batch_size: 512
+device_batch_size: 64
+sequence_length: 1024
+num_iterations: 5100
+learning_rate: 0.0036
+warmup_iters: 0
+warmdown_iters: 1450
+weight_decay: 0
+val_loss_every: 125
+val_tokens: 10485760
+save_every: 0
+block_optimizer: adago
+short_run: False
+block_lr_mult: 5.0
+adago_gamma: 1.0
+adago_eps: 5e-08
+====================================================================================================
+MODEL CONFIGURATION
+====================================================================================================
+Vocab Size: 50304
+Layers: 12
+Heads: 6
+Embedding Dim: 768
+====================================================================================================
+OPTIMIZER CONFIGURATIONS
+====================================================================================================
+LM Head: AdamW, lr=0.0036, betas=(0.9, 0.95), wd=0
+Transformer optimizer config: {'type': 'adago', 'lr': 0.0018, 'weight_decay': 0, 'momentum': 0.95, 'nesterov': True, 'backend': 'newtonschulz5', 'backend_steps': 5, 'gamma': 1.0, 'eps': 5e-08}
+====================================================================================================
+TRAINING CODE
+====================================================================================================
+# NOTE: record from https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt
+# ====================================================================================================
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import glob
+import time
+import json
+import random
+import subprocess
+from dataclasses import dataclass, asdict
+from datetime import datetime
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+import argparse
+
+# Matplotlib for training curve plots
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+HAS_MATPLOTLIB = True
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
+                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+                    scale = g.size(1)**0.5
+                else:
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                p.data.add_(g, alpha=-lr * scale)
+
+
+
+
+# AdAGo - adagrad-style adaptive gradient orthogonalization
+class AdAGo(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=3e-4,
+        momentum=0.95,
+        nesterov=True,
+        backend='newtonschulz5',
+        backend_steps=5,
+        gamma=1.0,
+        eps=5e-4,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            backend=backend,
+            backend_steps=backend_steps,
+            gamma=gamma,
+            eps=eps,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            gamma = group['gamma']
+            eps_floor = group['eps']
+            zeropower_backend = zeropower_backends[group['backend']]
+
+            # -------------------------------
+            # Group-level AdaGrad-Norm accumulator v^2
+            # -------------------------------
+            gstate = self.state.setdefault(id(group), {})
+            if 'v_sq' not in gstate:
+                gstate['v_sq'] = torch.zeros((), dtype=torch.float32)
+
+            total_norm_sq = 0.0
+            any_grad = False
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                any_grad = True
+                total_norm_sq += float((p.grad.detach().float() ** 2).sum().item())
+
+            if not any_grad:
+                continue
+
+            total_norm = total_norm_sq ** 0.5
+            capped_norm = min(total_norm, gamma)
+
+            # v_t^2 <- v_{t-1}^2 + min(||G||, gamma)^2
+            gstate['v_sq'] += torch.tensor(capped_norm * capped_norm, dtype=torch.float32)
+            v = float(gstate['v_sq'].sqrt().item())
+
+            # alpha_t = max(eps, lr * min(||G||, gamma) / v)
+            alpha = lr * (capped_norm / max(v, 1e-12))
+            alpha = max(eps_floor, alpha)
+
+            # Per-parameter momentum + orthogonalized update
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+
+                # Momentum buffer
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+
+                # Nesterov-style lookahead
+                g_mom = g.add(buf, alpha=momentum) if nesterov else buf
+
+                # Orthogonalize momentum update
+                if g_mom.size(0) == 3 * g_mom.size(1):
+                    g_ortho = torch.cat([
+                        zeropower_backend(g1, steps=group['backend_steps'])
+                        for g1 in g_mom.split(g_mom.size(1))
+                    ])
+                    scale = g_mom.size(1) ** 0.5
+                else:
+                    g_ortho = zeropower_backend(g_mom, steps=group['backend_steps'])
+                    scale = max(g_ortho.size(0), g_ortho.size(1)) ** 0.5
+
+                # Update
+                p.add_(g_ortho, alpha=-alpha * scale)
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        cos, sin = self.rotary(q)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    vocab_size : int = 50304
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+    def forward(self, idx, targets=None, return_logits=True):
+
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        for block in self.transformer.h:
+            x = block(x)
+        x = F.rms_norm(x, (x.size(-1),))
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
+
+        return logits, loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        # kick things off
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 5100 # number of iterations to run
+    learning_rate : float = 0.0036
+    warmup_iters : int = 0
+    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    #added fields
+    block_optimizer : str = 'adago'
+    short_run : bool = False
+
+    # tuning knobs
+    block_lr_mult : float = 0.1
+    adago_gamma : float = 1.0
+    adago_eps : float = 5e-4
+
+args = Hyperparameters()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--learning-rate", type=float, default=None)
+parser.add_argument("--adago-gamma", type=float, default=None)
+parser.add_argument("--adago-eps", type=float, default=None)
+parser.add_argument("--block-lr-mult", type=float, default=None)  # optional but useful
+
+cli, _ = parser.parse_known_args()
+
+block_opt_env = os.getenv("BLOCK_OPTIMIZER")
+if block_opt_env is not None:
+    args.block_optimizer = block_opt_env
+
+if cli.learning_rate is not None:
+    args.learning_rate = cli.learning_rate
+if cli.adago_gamma is not None:
+    args.adago_gamma = cli.adago_gamma
+if cli.adago_eps is not None:
+    args.adago_eps = cli.adago_eps
+if cli.block_lr_mult is not None:
+    args.block_lr_mult = cli.block_lr_mult
+
+if os.getenv("SHORT_RUN", "0") == "1":
+    args.short_run = True
+
+# if short_run is enabled, shrink iterations & val_tokens proportionally
+if args.short_run:
+    # e.g., ~500 iterations instead of 5100, fewer val tokens
+    print("Using short_run config, reducing num_iterations and val_tokens.")
+    # scale down roughly by 10x
+    args.num_iterations = 500
+    args.warmdown_iters = 150  # keep warmdown inside num_iterations
+    args.val_tokens = 2_097_152  # 2M tokens instead of 10M
+    args.val_loss_every = 100
+
+
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+# Set random seeds for reproducibility
+RANDOM_SEED = random.randint(0, 2**31 - 1)  # Generate a random seed, but log it
+if master_process:
+    print(f"Random seed: {RANDOM_SEED}")
+torch.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed_all(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# convenience variables
+B, T = args.device_batch_size, args.sequence_length
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (B * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (B * ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+x, y = train_loader.next_batch()
+
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = model.cuda()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
+ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+# init the optimizer(s)
+optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+weight_decay=args.weight_decay, fused=True,
+)
+
+#choose optimizer for transformer blocks
+block_params = raw_model.transformer.h.parameters()
+if args.block_optimizer.lower() == "muon":
+    print("Using Muon optimizer for transformer blocks.")
+    optimizer2 = Muon(block_params,
+                      lr=0.1 * args.learning_rate,
+                      momentum=0.95)
+elif args.block_optimizer.lower() == "adagrad":
+    print("Using Adagrad optimizer for transformer blocks.")
+    optimizer2 = torch.optim.Adagrad(block_params,
+                                     lr=0.1 * args.learning_rate,
+                                     weight_decay=args.weight_decay)
+elif args.block_optimizer.lower() == "adago":
+    print("Using AdAGo optimizer for transformer blocks.")
+    optimizer2 = AdAGo(
+        block_params,
+        lr= args.block_lr_mult * 0.1 * args.learning_rate,
+        momentum=0.95,
+        nesterov=True,
+        backend='newtonschulz5',
+        backend_steps=5,
+        gamma=1.0,
+        eps=5e-4,
+    )
+else:
+    raise ValueError(f"Unknown block_optimizer: {args.block_optimizer}")
+
+
+optimizers = [optimizer1, optimizer2]
+
+# learning rate decay scheduler (linear warmup and warmdown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    # 3) linear warmdown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+# begin logging
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/NanoGPT/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/NanoGPT/%s.txt' % run_id
+    json_logfile = 'logs/NanoGPT/%s.json' % run_id
+    
+    # Collect all metadata
+    start_time = datetime.now().isoformat()
+    
+    # Collect training/validation data for statistics
+    training_data = {
+        'train_losses': [],
+        'val_losses': [],
+        'train_times': [],
+        'steps': []
+    }
+    
+    # Create comprehensive metadata log
+    transformer_opt_cfg = {
+        'type': args.block_optimizer,
+        'lr': args.block_lr_mult * 0.1 * args.learning_rate,
+        'weight_decay': args.weight_decay,
+    }
+
+    if args.block_optimizer.lower() == "muon":
+        transformer_opt_cfg.update({
+            'momentum': 0.95,
+            'nesterov': True,
+            'backend': 'newtonschulz5',
+            'backend_steps': 5,
+        })
+    elif args.block_optimizer.lower() == "adago":
+        transformer_opt_cfg.update({
+            'momentum': 0.95,
+            'nesterov': True,
+            'backend': 'newtonschulz5',
+            'backend_steps': 5,
+            'gamma': args.adago_gamma,
+            'eps': args.adago_eps,
+        })
+    elif args.block_optimizer.lower() == "adagrad":
+        transformer_opt_cfg.update({
+            'adagrad_style': 'global_frobenius_norm',
+        })
+
+    metadata = {
+        'run_id': run_id,
+        'start_time': start_time,
+        'random_seed': RANDOM_SEED,
+        'ddp_world_size': ddp_world_size,
+        'hyperparameters': asdict(args),
+        'model_config': {
+            'vocab_size': num_vocab,
+            'n_layer': 12,
+            'n_head': 6,
+            'n_embd': 768,
+        },
+        'optimizer_configs': {
+            'lm_head': {
+                'type': 'AdamW',
+                'lr': args.learning_rate,
+                'betas': (0.9, 0.95),
+                'weight_decay': args.weight_decay,
+            },
+            'transformer': transformer_opt_cfg,
+        },
+    }
+    
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write('EXPERIMENT METADATA\n')
+        f.write('='*100 + '\n')
+        f.write(f"Run ID: {run_id}\n")
+        f.write(f"Start Time: {start_time}\n")
+        f.write(f"Random Seed: {RANDOM_SEED}\n")
+        f.write(f"DDP World Size: {ddp_world_size}\n")
+        f.write('='*100 + '\n')
+        f.write('HYPERPARAMETERS\n')
+        f.write('='*100 + '\n')
+        for key, value in asdict(args).items():
+            f.write(f"{key}: {value}\n")
+        f.write('='*100 + '\n')
+        f.write('MODEL CONFIGURATION\n')
+        f.write('='*100 + '\n')
+        f.write(f"Vocab Size: {num_vocab}\n")
+        f.write(f"Layers: 12\n")
+        f.write(f"Heads: 6\n")
+        f.write(f"Embedding Dim: 768\n")
+        f.write('='*100 + '\n')
+        f.write('OPTIMIZER CONFIGURATIONS\n')
+        f.write('='*100 + '\n')
+        f.write(f"LM Head: AdamW, lr={args.learning_rate}, betas=(0.9, 0.95), wd={args.weight_decay}\n")
+        f.write(f"Transformer optimizer config: {transformer_opt_cfg}\n")
+        f.write('='*100 + '\n')
+        f.write('TRAINING CODE\n')
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
+        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        f.write(f'{result.stdout}\n')
+        f.write('TRAINING LOG\n')
+        f.write('='*100 + '\n')
+    
+    # Save metadata to JSON
+    with open(json_logfile, 'w') as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
+t0 = time.time()
+# begin training
+train_loader.reset()
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.time()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
+            x_val, y_val = val_loader.next_batch()
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                _, loss = model(x_val, y_val, return_logits=False)
+                val_loss += loss.detach()
+                del loss
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        val_loss_value = float(val_loss.item())
+        
+        # Store validation data
+        if master_process:
+            training_data['val_losses'].append(val_loss_value)
+            training_data['steps'].append(step)
+            training_data['train_times'].append(training_time_ms)
+        
+        # log val loss to console and to logfile (only every 100 steps or at last step)
+        if master_process:
+            step_avg = training_time_ms/(timed_steps-1) if timed_steps > 1 else 0
+            log_line = f'step:{step}/{args.num_iterations} val_loss:{val_loss_value:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms'
+            print(log_line)
+            # Only write to log file every 100 steps or at the last step
+            if step % 100 == 0 or last_step:
+                with open(logfile, "a") as f:
+                    f.write(log_line + '\n')
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, 'logs/NanoGPT/%s/state_step%06d.pt' % (run_id, step))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
+        # advance the dataset for the next batch
+        x, y = train_loader.next_batch()
+        # backward pass
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
+
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    if master_process:
+        train_loss_value = float(train_loss.item())
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        
+        # Store training data
+        training_data['train_losses'].append(train_loss_value)
+        
+        step_avg = approx_time/timed_steps if timed_steps > 0 else 0
+        log_line = f"step:{step+1}/{args.num_iterations} train_loss:{train_loss_value:.4f} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms"
+        print(log_line)
+        # Only write to log file every 100 steps or at the last step
+        if (step + 1) % 100 == 0 or step == args.num_iterations - 1:
+            with open(logfile, "a") as f:
+                f.write(log_line + '\n')
+
+if master_process:
+    # Final statistics and logging
+    peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
+    
+    # Get final values
+    final_train_loss = float(training_data['train_losses'][-1]) if len(training_data['train_losses']) > 0 else None
+    final_val_loss = float(training_data['val_losses'][-1]) if len(training_data['val_losses']) > 0 else None
+    
+    # Print final results
+    print(f"\n{'='*100}")
+    print("TRAINING COMPLETE")
+    print(f"{'='*100}")
+    print(f"Peak memory consumption: {peak_memory_mib} MiB")
+    if final_train_loss is not None:
+        print(f"Final training loss: {final_train_loss:.4f}")
+    if final_val_loss is not None:
+        print(f"Final validation loss: {final_val_loss:.4f}")
+    print(f"Total training time: {training_time_ms:.0f} ms ({training_time_ms/1000:.2f} s)")
+    
+    # Write final results to log file
+    with open(logfile, "a") as f:
+        f.write(f"\n{'='*100}\n")
+        f.write("FINAL RESULTS\n")
+        f.write(f"{'='*100}\n")
+        f.write(f"Peak memory consumption: {peak_memory_mib} MiB\n")
+        if final_train_loss is not None:
+            f.write(f"Final training loss: {final_train_loss:.4f}\n")
+        if final_val_loss is not None:
+            f.write(f"Final validation loss: {final_val_loss:.4f}\n")
+        f.write(f"Total training time: {training_time_ms:.0f} ms ({training_time_ms/1000:.2f} s)\n")
+    
+    # Update JSON log with final results
+    metadata['end_time'] = datetime.now().isoformat()
+    metadata['training_time_ms'] = training_time_ms
+    metadata['peak_memory_mib'] = peak_memory_mib
+    if final_train_loss is not None:
+        metadata['final_train_loss'] = final_train_loss
+    if final_val_loss is not None:
+        metadata['final_val_loss'] = final_val_loss
+    metadata['training_data'] = {
+        'train_losses': training_data['train_losses'],
+        'val_losses': training_data['val_losses'],
+        'train_times_ms': training_data['train_times'],
+        'steps': training_data['steps']
+    }
+    
+    with open(json_logfile, 'w') as f:
+        json.dump(metadata, f, indent=2, default=str)
+    
+    # Generate training curves if matplotlib is available
+    if HAS_MATPLOTLIB and len(training_data['train_losses']) > 0:
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Plot training loss
+            if len(training_data['train_losses']) > 0:
+                steps_train = list(range(1, len(training_data['train_losses']) + 1))
+                axes[0].plot(steps_train, training_data['train_losses'], 'b-', linewidth=1.5, label='Training Loss')
+                axes[0].set_xlabel('Step')
+                axes[0].set_ylabel('Loss')
+                axes[0].set_title('Training Loss Curve')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+            
+            # Plot validation loss
+            if len(training_data['val_losses']) > 0:
+                axes[1].plot(training_data['steps'], training_data['val_losses'], 'r-', 
+                           marker='o', markersize=3, linewidth=1.5, label='Validation Loss')
+                axes[1].set_xlabel('Step')
+                axes[1].set_ylabel('Loss')
+                axes[1].set_title('Validation Loss Curve')
+                axes[1].legend()
+                axes[1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            curve_path = f'{logdir}/training_curves.png'
+            plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"\n📊 Training curves saved to: {os.path.abspath(curve_path)}")
+        except Exception as e:
+            print(f"Warning: Could not generate training curves: {e}")
+    
+    print(f"\n💾 Logs saved to:")
+    print(f"   Text: {os.path.abspath(logfile)}")
+    print(f"   JSON: {os.path.abspath(json_logfile)}")
+    print(f"{'='*100}\n")
+====================================================================================================
+Running pytorch 2.8.0+cu128 compiled for CUDA 12.8
+nvidia-smi:
+Tue Dec  9 22:20:28 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.195.03             Driver Version: 570.195.03     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100 80GB PCIe          On  |   00000000:00:07.0 Off |                    0 |
+| N/A   53C    P0            123W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100 80GB PCIe          On  |   00000000:00:08.0 Off |                    0 |
+| N/A   50C    P0             87W /  300W |    2129MiB /  81920MiB |      5%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100 80GB PCIe          On  |   00000000:00:09.0 Off |                    0 |
+| N/A   55C    P0            117W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100 80GB PCIe          On  |   00000000:00:0A.0 Off |                    0 |
+| N/A   53C    P0             86W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A100 80GB PCIe          On  |   00000000:00:0B.0 Off |                    0 |
+| N/A   52C    P0            149W /  300W |    2129MiB /  81920MiB |     20%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A100 80GB PCIe          On  |   00000000:00:0C.0 Off |                    0 |
+| N/A   50C    P0             86W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A100 80GB PCIe          On  |   00000000:00:0D.0 Off |                    0 |
+| N/A   50C    P0            112W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA A100 80GB PCIe          On  |   00000000:00:0E.0 Off |                    0 |
+| N/A   48C    P0             89W /  300W |    2129MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+TRAINING LOG
+====================================================================================================
+step:0/5100 val_loss:16.0026 train_time:263ms step_avg:0.00ms
+step:100/5100 train_loss:5.2817 train_time:37862ms step_avg:420.69ms
+step:200/5100 train_loss:4.4403 train_time:80309ms step_avg:422.68ms
+step:300/5100 train_loss:4.0676 train_time:121305ms step_avg:418.29ms
+step:400/5100 train_loss:3.9912 train_time:161762ms step_avg:414.78ms
+step:500/5100 train_loss:4.0355 train_time:203091ms step_avg:414.47ms
+step:500/5100 val_loss:3.9111 train_time:203091ms step_avg:414.47ms
+step:600/5100 train_loss:3.6742 train_time:243445ms step_avg:412.62ms
+step:700/5100 train_loss:3.9962 train_time:284754ms step_avg:412.69ms
+step:800/5100 train_loss:3.7503 train_time:326695ms step_avg:413.54ms
+step:900/5100 train_loss:3.6803 train_time:366731ms step_avg:412.06ms
+step:1000/5100 train_loss:3.7879 train_time:407032ms step_avg:411.14ms
+step:1000/5100 val_loss:3.6818 train_time:407032ms step_avg:411.14ms
+step:1100/5100 train_loss:3.7431 train_time:447062ms step_avg:410.15ms
+step:1200/5100 train_loss:3.5940 train_time:487363ms step_avg:409.55ms
+step:1300/5100 train_loss:3.6715 train_time:527400ms step_avg:408.84ms
+step:1400/5100 train_loss:3.6240 train_time:567709ms step_avg:408.42ms
+step:1500/5100 train_loss:3.6054 train_time:607710ms step_avg:407.86ms
+step:1500/5100 val_loss:3.5860 train_time:607710ms step_avg:407.86ms
+step:1600/5100 train_loss:3.6781 train_time:648006ms step_avg:407.55ms
+step:1700/5100 train_loss:3.5146 train_time:688774ms step_avg:407.56ms
+step:1800/5100 train_loss:3.5024 train_time:730231ms step_avg:407.95ms
+step:1900/5100 train_loss:3.4882 train_time:770544ms step_avg:407.70ms
+step:2000/5100 train_loss:3.4305 train_time:811636ms step_avg:407.86ms
+step:2000/5100 val_loss:3.5191 train_time:811637ms step_avg:407.86ms
+step:2100/5100 train_loss:3.4740 train_time:852508ms step_avg:407.90ms
+step:2200/5100 train_loss:3.4912 train_time:892507ms step_avg:407.54ms
+step:2300/5100 train_loss:3.8244 train_time:932809ms step_avg:407.34ms
+step:2400/5100 train_loss:3.2971 train_time:972825ms step_avg:407.04ms
+step:2500/5100 train_loss:3.4595 train_time:1013113ms step_avg:406.87ms
+step:2500/5100 val_loss:3.4798 train_time:1013113ms step_avg:406.87ms
+step:2600/5100 train_loss:3.4538 train_time:1053119ms step_avg:406.61ms
+step:2700/5100 train_loss:3.3936 train_time:1093469ms step_avg:406.49ms
+step:2800/5100 train_loss:3.3865 train_time:1133473ms step_avg:406.26ms
+step:2900/5100 train_loss:3.3339 train_time:1173747ms step_avg:406.14ms
+step:3000/5100 train_loss:3.4669 train_time:1213744ms step_avg:405.93ms
+step:3000/5100 val_loss:3.4503 train_time:1213745ms step_avg:405.93ms
+step:3100/5100 train_loss:3.4227 train_time:1254006ms step_avg:405.83ms
+step:3200/5100 train_loss:3.4420 train_time:1294022ms step_avg:405.65ms
+step:3300/5100 train_loss:3.5474 train_time:1334297ms step_avg:405.56ms
+step:3400/5100 train_loss:3.3491 train_time:1376068ms step_avg:405.92ms
+step:3500/5100 train_loss:3.3017 train_time:1417200ms step_avg:406.07ms
+step:3500/5100 val_loss:3.4304 train_time:1417201ms step_avg:406.07ms
+step:3600/5100 train_loss:3.3283 train_time:1457323ms step_avg:405.94ms
+step:3700/5100 train_loss:3.4404 train_time:1497461ms step_avg:405.82ms
+step:3800/5100 train_loss:3.3801 train_time:1537727ms step_avg:405.73ms
+step:3900/5100 train_loss:3.4201 train_time:1577710ms step_avg:405.58ms
+step:4000/5100 train_loss:3.3927 train_time:1617955ms step_avg:405.50ms
+step:4000/5100 val_loss:3.4024 train_time:1617956ms step_avg:405.50ms
+step:4100/5100 train_loss:3.4610 train_time:1657906ms step_avg:405.36ms
+step:4200/5100 train_loss:3.3832 train_time:1698142ms step_avg:405.28ms
+step:4300/5100 train_loss:3.4952 train_time:1738107ms step_avg:405.15ms
+step:4400/5100 train_loss:3.5074 train_time:1778337ms step_avg:405.09ms
+step:4500/5100 train_loss:3.4447 train_time:1818306ms step_avg:404.97ms
+step:4500/5100 val_loss:3.3787 train_time:1818306ms step_avg:404.97ms
+step:4600/5100 train_loss:3.3210 train_time:1858572ms step_avg:404.92ms
+step:4700/5100 train_loss:3.2404 train_time:1898548ms step_avg:404.81ms
+step:4800/5100 train_loss:3.1430 train_time:1938811ms step_avg:404.76ms
+step:4900/5100 train_loss:3.4270 train_time:1978779ms step_avg:404.66ms
+step:5000/5100 train_loss:3.2654 train_time:2019030ms step_avg:404.62ms
+step:5000/5100 val_loss:3.3564 train_time:2019031ms step_avg:404.62ms
+step:5100/5100 train_loss:3.2966 train_time:2059002ms step_avg:404.52ms
+step:5100/5100 val_loss:3.3520 train_time:2059003ms step_avg:404.52ms
+
+====================================================================================================
+FINAL RESULTS
+====================================================================================================
+Peak memory consumption: 30555 MiB
+Final training loss: 3.2966
+Final validation loss: 3.3520
+Total training time: 2059003 ms (2059.00 s)
