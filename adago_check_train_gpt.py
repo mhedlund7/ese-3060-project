@@ -535,7 +535,7 @@ elif args.block_optimizer.lower() == "adago":
     print("Using AdAGo optimizer for transformer blocks.")
     optimizer2 = AdAGo(
         block_params,
-        lr=0.1 * args.learning_rate,
+        lr= 5 * 0.1 * args.learning_rate,
         momentum=0.95,
         nesterov=True,
         backend='newtonschulz5',
