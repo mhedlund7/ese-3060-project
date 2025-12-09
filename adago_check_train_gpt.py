@@ -564,7 +564,7 @@ elif args.block_optimizer.lower() == "adago":
         backend='newtonschulz5',
         backend_steps=5,
         gamma=1.0,
-        eps=0.25 *0.1 * args.learning_rate,
+        eps=args.adago_eps *0.1 * args.learning_rate,
     )
 else:
     raise ValueError(f"Unknown block_optimizer: {args.block_optimizer}")
