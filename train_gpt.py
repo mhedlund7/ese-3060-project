@@ -7,7 +7,11 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
-from dataclasses import dataclass
+import json
+import random
+import subprocess
+from dataclasses import dataclass, asdict
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -16,6 +20,12 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Matplotlib for training curve plots
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+HAS_MATPLOTLIB = True
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -347,6 +357,15 @@ torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
+# Set random seeds for reproducibility
+RANDOM_SEED = random.randint(0, 2**31 - 1)  # Generate a random seed, but log it
+if master_process:
+    print(f"Random seed: {RANDOM_SEED}")
+torch.manual_seed(RANDOM_SEED)
+torch.cuda.manual_seed_all(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
@@ -400,22 +419,94 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimize
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
-    logdir = 'logs/%s/' % run_id
+    logdir = 'logs/NanoGPT/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
-    logfile = 'logs/%s.txt' % run_id
+    logfile = 'logs/NanoGPT/%s.txt' % run_id
+    json_logfile = 'logs/NanoGPT/%s.json' % run_id
+    
+    # Collect all metadata
+    start_time = datetime.now().isoformat()
+    
+    # Collect training/validation data for statistics
+    training_data = {
+        'train_losses': [],
+        'val_losses': [],
+        'train_times': [],
+        'steps': []
+    }
+    
+    # Create comprehensive metadata log
+    metadata = {
+        'run_id': run_id,
+        'start_time': start_time,
+        'random_seed': RANDOM_SEED,
+        'ddp_world_size': ddp_world_size,
+        'hyperparameters': asdict(args),
+        'model_config': {
+            'vocab_size': num_vocab,
+            'n_layer': 12,
+            'n_head': 6,
+            'n_embd': 768
+        },
+        'optimizer_configs': {
+            'lm_head': {
+                'type': 'AdamW',
+                'lr': args.learning_rate,
+                'betas': (0.9, 0.95),
+                'weight_decay': args.weight_decay
+            },
+            'transformer': {
+                'type': 'Muon',
+                'lr': 0.1 * args.learning_rate,
+                'momentum': 0.95,
+                'nesterov': True
+            }
+        }
+    }
+    
     # create the log file
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write('EXPERIMENT METADATA\n')
+        f.write('='*100 + '\n')
+        f.write(f"Run ID: {run_id}\n")
+        f.write(f"Start Time: {start_time}\n")
+        f.write(f"Random Seed: {RANDOM_SEED}\n")
+        f.write(f"DDP World Size: {ddp_world_size}\n")
+        f.write('='*100 + '\n')
+        f.write('HYPERPARAMETERS\n')
+        f.write('='*100 + '\n')
+        for key, value in asdict(args).items():
+            f.write(f"{key}: {value}\n")
+        f.write('='*100 + '\n')
+        f.write('MODEL CONFIGURATION\n')
+        f.write('='*100 + '\n')
+        f.write(f"Vocab Size: {num_vocab}\n")
+        f.write(f"Layers: 12\n")
+        f.write(f"Heads: 6\n")
+        f.write(f"Embedding Dim: 768\n")
+        f.write('='*100 + '\n')
+        f.write('OPTIMIZER CONFIGURATIONS\n')
+        f.write('='*100 + '\n')
+        f.write(f"LM Head: AdamW, lr={args.learning_rate}, betas=(0.9, 0.95), wd={args.weight_decay}\n")
+        f.write(f"Transformer: Muon, lr={0.1*args.learning_rate}, momentum=0.95, nesterov=True\n")
+        f.write('='*100 + '\n')
+        f.write('TRAINING CODE\n')
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
         # log information about the hardware/software environment this is running on
         # and print the full `nvidia-smi` to file
         f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
-        import subprocess
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
+        f.write('TRAINING LOG\n')
         f.write('='*100 + '\n')
+    
+    # Save metadata to JSON
+    with open(json_logfile, 'w') as f:
+        json.dump(metadata, f, indent=2, default=str)
 
 training_time_ms = 0
 # start the clock
@@ -450,11 +541,21 @@ for step in range(args.num_iterations + 1):
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
+        val_loss_value = float(val_loss.item())
+        
+        # Store validation data
+        if master_process:
+            training_data['val_losses'].append(val_loss_value)
+            training_data['steps'].append(step)
+            training_data['train_times'].append(training_time_ms)
+        
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            step_avg = training_time_ms/(timed_steps-1) if timed_steps > 1 else 0
+            log_line = f'step:{step}/{args.num_iterations} val_loss:{val_loss_value:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms'
+            print(log_line)
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                f.write(log_line + '\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -465,7 +566,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-        torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        torch.save(log, 'logs/NanoGPT/%s/state_step%06d.pt' % (run_id, step))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -505,10 +606,101 @@ for step in range(args.num_iterations + 1):
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
+        train_loss_value = float(train_loss.item())
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        
+        # Store training data
+        training_data['train_losses'].append(train_loss_value)
+        
+        step_avg = approx_time/timed_steps if timed_steps > 0 else 0
+        log_line = f"step:{step+1}/{args.num_iterations} train_loss:{train_loss_value:.4f} train_time:{approx_time:.0f}ms step_avg:{step_avg:.2f}ms"
+        print(log_line)
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(log_line + '\n')
 
 if master_process:
-    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    # Final statistics and logging
+    peak_memory_mib = torch.cuda.max_memory_allocated() // 1024 // 1024
+    
+    # Get final values
+    final_train_loss = float(training_data['train_losses'][-1]) if len(training_data['train_losses']) > 0 else None
+    final_val_loss = float(training_data['val_losses'][-1]) if len(training_data['val_losses']) > 0 else None
+    
+    # Print final results
+    print(f"\n{'='*100}")
+    print("TRAINING COMPLETE")
+    print(f"{'='*100}")
+    print(f"Peak memory consumption: {peak_memory_mib} MiB")
+    if final_train_loss is not None:
+        print(f"Final training loss: {final_train_loss:.4f}")
+    if final_val_loss is not None:
+        print(f"Final validation loss: {final_val_loss:.4f}")
+    print(f"Total training time: {training_time_ms:.0f} ms ({training_time_ms/1000:.2f} s)")
+    
+    # Write final results to log file
+    with open(logfile, "a") as f:
+        f.write(f"\n{'='*100}\n")
+        f.write("FINAL RESULTS\n")
+        f.write(f"{'='*100}\n")
+        f.write(f"Peak memory consumption: {peak_memory_mib} MiB\n")
+        if final_train_loss is not None:
+            f.write(f"Final training loss: {final_train_loss:.4f}\n")
+        if final_val_loss is not None:
+            f.write(f"Final validation loss: {final_val_loss:.4f}\n")
+        f.write(f"Total training time: {training_time_ms:.0f} ms ({training_time_ms/1000:.2f} s)\n")
+    
+    # Update JSON log with final results
+    metadata['end_time'] = datetime.now().isoformat()
+    metadata['training_time_ms'] = training_time_ms
+    metadata['peak_memory_mib'] = peak_memory_mib
+    if final_train_loss is not None:
+        metadata['final_train_loss'] = final_train_loss
+    if final_val_loss is not None:
+        metadata['final_val_loss'] = final_val_loss
+    metadata['training_data'] = {
+        'train_losses': training_data['train_losses'],
+        'val_losses': training_data['val_losses'],
+        'train_times_ms': training_data['train_times'],
+        'steps': training_data['steps']
+    }
+    
+    with open(json_logfile, 'w') as f:
+        json.dump(metadata, f, indent=2, default=str)
+    
+    # Generate training curves if matplotlib is available
+    if HAS_MATPLOTLIB and len(training_data['train_losses']) > 0:
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # Plot training loss
+            if len(training_data['train_losses']) > 0:
+                steps_train = list(range(1, len(training_data['train_losses']) + 1))
+                axes[0].plot(steps_train, training_data['train_losses'], 'b-', linewidth=1.5, label='Training Loss')
+                axes[0].set_xlabel('Step')
+                axes[0].set_ylabel('Loss')
+                axes[0].set_title('Training Loss Curve')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+            
+            # Plot validation loss
+            if len(training_data['val_losses']) > 0:
+                axes[1].plot(training_data['steps'], training_data['val_losses'], 'r-', 
+                           marker='o', markersize=3, linewidth=1.5, label='Validation Loss')
+                axes[1].set_xlabel('Step')
+                axes[1].set_ylabel('Loss')
+                axes[1].set_title('Validation Loss Curve')
+                axes[1].legend()
+                axes[1].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            curve_path = f'{logdir}/training_curves.png'
+            plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"\n📊 Training curves saved to: {os.path.abspath(curve_path)}")
+        except Exception as e:
+            print(f"Warning: Could not generate training curves: {e}")
+    
+    print(f"\n💾 Logs saved to:")
+    print(f"   Text: {os.path.abspath(logfile)}")
+    print(f"   JSON: {os.path.abspath(json_logfile)}")
+    print(f"{'='*100}\n")
