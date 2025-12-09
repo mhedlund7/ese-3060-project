@@ -114,47 +114,101 @@ class Muon(torch.optim.Optimizer):
                     scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
                 p.data.add_(g, alpha=-lr * scale)
 
+
+
+
 # AdAGo - adagrad-style adaptive gradient orthogonalization
 class AdAGo(torch.optim.Optimizer):
-    def __init__(self, params, lr=3e-4, backend='newtonschulz5', backend_steps=5, eps=1e-8):
-        defaults = dict(lr=lr, backend=backend, backend_steps=backend_steps, eps=eps)
+    def __init__(
+        self,
+        params,
+        lr=3e-4,
+        momentum=0.95,
+        nesterov=True,
+        backend='newtonschulz5',
+        backend_steps=5,
+        gamma=1.0,
+        eps=5e-4,
+    ):
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            nesterov=nesterov,
+            backend=backend,
+            backend_steps=backend_steps,
+            gamma=gamma,
+            eps=eps,
+        )
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr = group['lr']
-            eps = group['eps']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            gamma = group['gamma']
+            eps_floor = group['eps']
             zeropower_backend = zeropower_backends[group['backend']]
 
+            # -------------------------------
+            # Group-level AdaGrad-Norm accumulator v^2
+            # -------------------------------
+            gstate = self.state.setdefault(id(group), {})
+            if 'v_sq' not in gstate:
+                gstate['v_sq'] = torch.zeros((), dtype=torch.float32)
+
+            total_norm_sq = 0.0
+            any_grad = False
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                any_grad = True
+                total_norm_sq += float((p.grad.detach().float() ** 2).sum().item())
+
+            if not any_grad:
+                continue
+
+            total_norm = total_norm_sq ** 0.5
+            capped_norm = min(total_norm, gamma)
+
+            # v_t^2 <- v_{t-1}^2 + min(||G||, gamma)^2
+            gstate['v_sq'] += torch.tensor(capped_norm * capped_norm, dtype=torch.float32)
+            v = float(gstate['v_sq'].sqrt().item())
+
+            # alpha_t = max(eps, lr * min(||G||, gamma) / v)
+            alpha = lr * (capped_norm / max(v, 1e-12))
+            alpha = max(eps_floor, alpha)
+
+            # Per-parameter momentum + orthogonalized update
             for p in group['params']:
                 g = p.grad
                 if g is None:
                     continue
 
-                # single scalar accumulator per parameter
+                # Momentum buffer
                 state = self.state[p]
-                if 'sum_sq_grad' not in state:
-                    # scalar on the same device, use float32 for stability
-                    state['sum_sq_grad'] = torch.zeros((), device=g.device, dtype=torch.float32)
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
 
-                g_norm2 = (g.detach().float() ** 2).sum()
-                state['sum_sq_grad'] += g_norm2
-                # adagrad stepsize for this parameter
-                lr_eff = lr / (state['sum_sq_grad'].sqrt() + eps)
+                # Nesterov-style lookahead
+                g_mom = g.add(buf, alpha=momentum) if nesterov else buf
 
-                # orthogonalize like Muon (but without momentum)
-                if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
-                    g_ortho_list = []
-                    for g1 in g.split(g.size(1)):
-                        g1_ortho = zeropower_backend(g1, steps=group['backend_steps'])
-                        g_ortho_list.append(g1_ortho)
-                    g_ortho = torch.cat(g_ortho_list)
-                    scale = g.size(1) ** 0.5
+                # Orthogonalize momentum update
+                if g_mom.size(0) == 3 * g_mom.size(1):
+                    g_ortho = torch.cat([
+                        zeropower_backend(g1, steps=group['backend_steps'])
+                        for g1 in g_mom.split(g_mom.size(1))
+                    ])
+                    scale = g_mom.size(1) ** 0.5
                 else:
-                    g_ortho = zeropower_backend(g, steps=group['backend_steps'])
+                    g_ortho = zeropower_backend(g_mom, steps=group['backend_steps'])
                     scale = max(g_ortho.size(0), g_ortho.size(1)) ** 0.5
-                # update
-                p.data.add_(g_ortho, alpha=-lr_eff * scale)
+
+                # Update
+                p.add_(g_ortho, alpha=-alpha * scale)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -479,11 +533,16 @@ elif args.block_optimizer.lower() == "adagrad":
                                      weight_decay=args.weight_decay)
 elif args.block_optimizer.lower() == "adago":
     print("Using AdAGo optimizer for transformer blocks.")
-    optimizer2 = AdAGo(block_params,
-                       lr=0.1 * args.learning_rate,
-                       backend='newtonschulz5',
-                       backend_steps=5,
-                       eps=1e-8)
+    optimizer2 = AdAGo(
+        block_params,
+        lr=0.1 * args.learning_rate,
+        momentum=0.95,
+        nesterov=True,
+        backend='newtonschulz5',
+        backend_steps=5,
+        gamma=1.0,
+        eps=5e-4,
+    )
 else:
     raise ValueError(f"Unknown block_optimizer: {args.block_optimizer}")
 
@@ -540,12 +599,14 @@ if master_process:
         })
     elif args.block_optimizer.lower() == "adago":
         transformer_opt_cfg.update({
+            'momentum': 0.95,
+            'nesterov': True,
             'backend': 'newtonschulz5',
             'backend_steps': 5,
-            'eps': 1e-8,
+            'gamma': 1.0,
+            'eps': 5e-4,
         })
     elif args.block_optimizer.lower() == "adagrad":
-        # nothing extra needed, but you can add notes if you want
         transformer_opt_cfg.update({
             'adagrad_style': 'global_frobenius_norm',
         })
