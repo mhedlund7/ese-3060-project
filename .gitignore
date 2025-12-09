@@ -1,0 +1,8 @@
+# model checkpoints too large for GitHub
+logs/**/*.pt
+logs/**/state_step*.pt
+
+# Keep log files but ignore model weights
+!logs/**/*.txt
+!logs/**/*.json
+!logs/**/*.png
