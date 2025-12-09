@@ -446,7 +446,7 @@ class Hyperparameters:
     short_run : bool = False
 
     # tuning knobs
-    block_lr_mult : float = 0.1
+    block_lr_mult : float = 100.0
     adago_gamma : float = 1.0
     adago_eps : float = 5e-4
 
