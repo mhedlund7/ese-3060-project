@@ -113,49 +113,141 @@ python airbench94_lion_hardswish_experiments.py --mode hardswish --lr 12.0 --epo
 
 ## Part 2: NanoGPT Speedrun
 
+### Quick Benchmark: Best AdAGo Configuration
+
+To run a quick benchmark with our best AdAGo optimizer configuration:
+
+```bash
+git clone https://github.com/mhedlund7/ese-3060-project.git
+cd ese-3060-project
+pip install -r requirements.txt
+
+# Download the FineWeb-10B dataset (if not already downloaded)
+python cached_fineweb10B.py 9
+
+# Run training with AdAGo optimizer
+torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036 \
+    --block-lr-mult 5.0 \
+    --adago-gamma 1.0 \
+    --adago-eps 5e-08
+```
+
+This runs the full 5100-step training with AdAGo optimizer for transformer blocks and AdamW for the language model head.
+
+### Short Run for Testing
+
+For faster testing and development, use the short run mode (500 iterations):
+
+```bash
+SHORT_RUN=1 torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036 \
+    --block-lr-mult 100.0 \
+    --adago-gamma 1.0 \
+    --adago-eps 0.0005
+```
+
 ### Experimentation Process
 
 Our final report detailing our full process can be found ~~[here]().~~
 
 **Code Evolution:**
 
-1. Started with the base `train_gpt.py` file (now saved as `orig_train_gpt.py`) and added runtime tracking
-2. Created `adagrad_check_train_gpt.py` and `airbench94_preliminary_experiments.py` to test various modifications
-3. Performed hyperparameter sweeps for learning rate, epsilon, and gamma of AdaGO
-4. ~~Final experiments implemented in `airbench94_lion_hardswish_experiments.py`~~
-5. ~~Comprehensive statistical analysis performed with `final_benchmark.py`~~
+1. Started with the base `train_gpt.py` file (now saved as `orig_train_gpt.py`) and added comprehensive logging
+2. Created `adago_check_train_gpt.py` to implement the AdAGo optimizer (AdaGrad-style adaptive gradient orthogonalization)
+3. Performed hyperparameter sweeps for learning rate, epsilon (`eps`), gamma, and block learning rate multiplier
+4. Tested different optimizer configurations: Muon (baseline), Adagrad, and AdAGo
+5. Final experiments focused on AdAGo with optimized hyperparameters
 
 **Hardware:**
 
-- All experiments run on RunPod using 8 A100 PCIe GPUs with on-demand instances
+- All experiments run on RunPod using 8× A100 PCIe GPUs with on-demand instances
+- Distributed training using PyTorch's `torchrun` with 8 processes
+
+### Command Line Arguments for Experiments
+
+The `adago_check_train_gpt.py` script supports the following command-line arguments:
+
+**Optimizer Selection:**
+
+- `BLOCK_OPTIMIZER` environment variable: Choose optimizer for transformer blocks (default: `adago`)
+  - `muon`: Muon optimizer (baseline - momentum with orthogonalized updates)
+  - `adagrad`: Standard Adagrad optimizer
+  - `adago`: AdAGo optimizer (AdaGrad-style adaptive gradient orthogonalization)
+
+**Hyperparameters:**
+
+- `--learning-rate`: Base learning rate (default: `0.0036`)
+- `--block-lr-mult`: Learning rate multiplier for transformer block optimizer (default: `100.0`)
+  - Final block optimizer LR = `block_lr_mult * 0.1 * learning_rate`
+- `--adago-gamma`: Gamma parameter for AdAGo (gradient norm capping, default: `1.0`)
+- `--adago-eps`: Epsilon parameter for AdAGo (minimum step size floor, default: `5e-4`)
+
+**Environment Variables:**
+
+- `SHORT_RUN=1`: Enable short run mode (500 iterations instead of 5100, reduced validation tokens)
+
+**Example Commands:**
+
+```bash
+# Run baseline Muon optimizer
+BLOCK_OPTIMIZER=muon torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036
+
+# Run AdAGo with default hyperparameters
+torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036 \
+    --block-lr-mult 100.0 \
+    --adago-gamma 1.0 \
+    --adago-eps 0.0005
+
+# Run AdAGo with custom hyperparameters
+torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036 \
+    --block-lr-mult 5.0 \
+    --adago-gamma 1.0 \
+    --adago-eps 0.0005
+
+# Short run for quick testing
+SHORT_RUN=1 torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
+    --learning-rate 0.0036 \
+    --block-lr-mult 100.0
+```
 
 **Output:**
 
-- Step-by-step training logs with `train_loss`, running `train_time` (ms), and per-step average time
-- Periodic and final validation logs with `val_loss`, cumulative `train_time`, and per-step average time
-- Final summary:
-  - Peak GPU memory usag (MiB)
-  - Final training loss
-  - Final validation loss
-  - Total training time (ms and seconds)
-- Text log file - `logs/NanoGPT/{uuid}/log.txt`
-  * Experiment metadata (run ID, timestamps, random seed, world size).
-  * Full hyperparameter dump (`Hyperparameters` dataclass).
-  * Model configuration (layers, heads, embedding dim, vocab size).
-  * Optimizer configuration (AdamW for `lm_head`, AdAGo/Muon/Adagrad for blocks).
-  * Full training script source code snapshot.
-  * `nvidia-smi` output for hardware context.
-  * All training and validation log lines (same format as console).
-  * Final results block (peak memory, final losses, total training time).
-- JSON log file - `logs/NanoGPT/{uuid}/log.json`
-  * Same high-level metadata (run ID, start/end time, hyperparameters, model & optimizer config).
-  * Scalar results:
-    * `training_time_ms`, `peak_memory_mib`, `final_train_loss`, `final_val_loss`.
-  * Full training traces under `training_data`:
-    * `train_losses` (per logged step)
-    * `val_losses` (per validation evaluation)
-    * `train_times_ms` (cumulative train time at each validation)
-    * `steps` (corresponding iteration indices)
+- **Console Output:**
+  - Step-by-step training logs with `train_loss`, cumulative `train_time` (ms), and per-step average time
+  - Periodic validation logs (every 125 steps by default) with `val_loss`, cumulative `train_time`, and per-step average time
+  - Final summary:
+    - Peak GPU memory usage (MiB)
+    - Final training loss
+    - Final validation loss
+    - Total training time (ms and seconds)
+    - Paths to saved log files and training curves
+
+- **Text Log File** - `logs/NanoGPT/{uuid}.txt`:
+  - Experiment metadata (run ID, timestamps, random seed, DDP world size)
+  - Full hyperparameter dump (`Hyperparameters` dataclass)
+  - Model configuration (layers, heads, embedding dim, vocab size)
+  - Optimizer configuration (AdamW for `lm_head`, AdAGo/Muon/Adagrad for transformer blocks)
+  - Full training script source code snapshot
+  - `nvidia-smi` output for hardware context
+  - All training and validation log lines (same format as console)
+  - Final results block (peak memory, final losses, total training time)
+
+- **JSON Log File** - `logs/NanoGPT/{uuid}.json`:
+  - Same high-level metadata (run ID, start/end time, hyperparameters, model & optimizer config)
+  - Scalar results:
+    - `training_time_ms`, `peak_memory_mib`, `final_train_loss`, `final_val_loss`
+  - Full training traces under `training_data`:
+    - `train_losses` (per logged step)
+    - `val_losses` (per validation evaluation)
+    - `train_times_ms` (cumulative train time at each validation)
+    - `steps` (corresponding iteration indices)
+
+- **Training Curves** - `logs/NanoGPT/{uuid}/training_curves.png`:
+  - Two-panel plot showing training loss and validation loss curves over training steps
 
 # Original Project Information
 
