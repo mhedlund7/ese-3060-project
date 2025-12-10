@@ -124,6 +124,8 @@ pip install -r requirements.txt
 
 # Download the FineWeb-10B dataset (if not already downloaded)
 python cached_fineweb10B.py 9
+mkdir -p data/fineweb10B
+mv fineweb10B/fineweb_train_*.bin fineweb10B/fineweb_val_*.bin data/fineweb10B/
 
 # Run training with AdAGo optimizer
 torchrun --standalone --nproc_per_node=8 adago_check_train_gpt.py \
